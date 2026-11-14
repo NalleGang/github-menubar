@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "mulm.github",
+  "name": "GitHub",
+  "version": "1.0.0",
+  "author": "mulm",
+  "license": "MIT",
+  "description": "Local repos and GitHub at a glance: unpushed commits, commit history, CI, PRs, notifications and contributions.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Widget.qml" },
+  "barWidget": {
+    "displayName": "GitHub",
+    "description": "Unpushed/behind commit counts in the bar; click for repos with commit history, push/pull/lazygit actions, CI state, PRs, review requests and the contribution graph.",
+    "category": "Developer",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "roots": "~/Projects",
+      "maxRepos": 8,
+      "localIntervalSec": 10,
+      "remoteIntervalSec": 180,
+      "fetchIntervalMin": 15,
+      "barNotifications": false
+    },
+    "schema": [
+      { "key": "roots", "type": "string", "label": "Repo folders", "defaultValue": "~/Projects", "description": "Comma-separated folders; each folder and its direct subfolders are scanned for git repos." },
+      { "key": "maxRepos", "type": "integer", "label": "Repos listed", "min": 1, "max": 50, "step": 1, "defaultValue": 8, "description": "Most recently committed repos shown; repos with unpushed or unpulled commits are always shown." },
+      { "key": "localIntervalSec", "type": "integer", "label": "Local refresh (seconds)", "min": 2, "max": 600, "step": 1, "defaultValue": 10 },
+      { "key": "remoteIntervalSec", "type": "integer", "label": "GitHub refresh (seconds)", "min": 30, "max": 3600, "step": 30, "defaultValue": 180 },
+      { "key": "fetchIntervalMin", "type": "integer", "label": "Background git fetch (minutes, 0 = off)", "min": 0, "max": 240, "step": 5, "defaultValue": 15 },
+      { "key": "barNotifications", "type": "boolean", "label": "Notification count in bar", "defaultValue": false, "description": "Also show the unread GitHub notification count next to the icon." }
+    ]
+  }
+}
