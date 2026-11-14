@@ -33,6 +33,14 @@ omarchy plugin add https://github.com/mulmlord/omarchy-github.git --enable
 
 Update with `omarchy plugin update mulm.github`.
 
+## Remove
+
+```bash
+omarchy plugin remove mulm.github
+```
+
+This removes the widget from the bar and deletes its folder. The widget stores nothing anywhere else.
+
 ## Settings
 
 | Setting | Default | |
