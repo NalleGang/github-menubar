@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run one git action for the widget and report the result as a notification.
-# Usage: action.sh push|pull|lazygit <repo>   |   action.sh fetch <repo>...
+# Usage: action.sh commit <repo> <message> | stage|push|pull|lazygit <repo> | fetch <repo>...
 export GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=10"
 action=$1; shift
 notify() { omarchy-notification-send --app-name GitHub -g 󰊤 "$@" 2>/dev/null || notify-send -a GitHub "$@"; }
@@ -15,6 +15,32 @@ esac
 
 repo=$1 name=${1##*/}
 case $action in
+  stage)
+    out=$(timeout 90 git -C "$repo" add --all 2>&1)
+    status=$?
+    if ((status == 0)); then
+      notify "Changes staged"
+    else
+      notify -u critical "Stage all failed" "$(tail -n 4 <<< "$out" | jq -Rs @html -r)"
+    fi
+    exit "$status" ;;
+  commit)
+    if [[ ! ${2:-} =~ [^[:space:]] ]]; then
+      notify "Commit failed" "Enter a commit message."
+      exit 2
+    fi
+    if git -C "$repo" diff --cached --quiet --; then
+      notify "Commit failed" "Stage changes before committing."
+      exit 2
+    fi
+    out=$(timeout 90 git -C "$repo" commit --message "$2" 2>&1)
+    status=$?
+    if ((status == 0)); then
+      notify "Changes committed" "Use Push to sync the commit."
+    else
+      notify -u critical "Commit failed" "$(tail -n 4 <<< "$out" | jq -Rs @html -r)"
+    fi
+    exit "$status" ;;
   push)
     if git -C "$repo" rev-parse --abbrev-ref '@{push}' > /dev/null 2>&1; then
       out=$(timeout 90 git -C "$repo" push 2>&1)

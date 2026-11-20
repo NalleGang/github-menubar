@@ -13,7 +13,7 @@ import qs.Ui
 // the viewer's PRs and review requests, and the contribution graph.
 //
 // Data: local.sh (git only, polled), remote.sh (one gh GraphQL call, polled
-// slowly), action.sh (push/pull/fetch/lazygit). IPC: omarchy-shell mulm.github toggle
+// slowly), action.sh (stage/commit/push/pull/fetch/lazygit). IPC: omarchy-shell mulm.github toggle
 Panel {
   id: root
   moduleName: "mulm.github"
@@ -27,6 +27,8 @@ Panel {
   readonly property int fetchIntervalMin: Math.max(0, Number(setting("fetchIntervalMin", 15)) || 0)
   readonly property bool barNotifications: setting("barNotifications", false) === true
 
+  Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
+
   property var localRepos: []
   property var remote: ({})
   property string remoteError: ""
@@ -36,6 +38,7 @@ Panel {
   property real nowSec: Date.now() / 1000
   property bool showAll: false
   property string expandedPath: ""
+  signal commitSucceeded(string repoPath)
   property int cursorIndex: 0
   property bool cursorActive: false
   property string pendingAction: ""   // "<kind>:<path>" while action.sh runs
@@ -209,12 +212,15 @@ Panel {
   // ---------- actions ----------
   function isPending(kind, repo) { return repo && pendingAction === kind + ":" + repo.path }
 
-  function runAction(kind, repo) {
+  function runAction(kind, repo, message) {
     if (!repo || actionProc.running) return
+    if (kind === "commit" && (!repo.staged || repo.conflicts || !message)) return
     if (kind === "push" && !(repo.ahead > 0 && repo.remote !== "")) return
     if (kind === "pull" && !(repo.behind > 0)) return
     pendingAction = kind + ":" + repo.path
-    actionProc.command = [pluginDir + "/action.sh", kind, repo.path]
+    actionProc.command = kind === "commit"
+      ? [pluginDir + "/action.sh", kind, repo.path, message]
+      : [pluginDir + "/action.sh", kind, repo.path]
     actionProc.running = true
   }
 
@@ -298,10 +304,12 @@ Panel {
 
   Process {
     id: actionProc
-    onExited: {
+    onExited: function(exitCode) {
+      if (exitCode === 0 && root.pendingAction.startsWith("commit:"))
+        root.commitSucceeded(root.pendingAction.slice("commit:".length))
+      if (/^(push|pull):/.test(root.pendingAction)) remoteDelay.restart()
       root.pendingAction = ""
       root.refreshLocal()
-      remoteDelay.restart()
     }
   }
 
@@ -669,7 +677,7 @@ Panel {
     readonly property bool expanded: root.expandedPath === repo.path
     readonly property bool hot: selected || rowMouse.containsMouse || actionsHovered
     property bool actionsHovered: false
-    readonly property int changes: repo.staged + repo.modified + repo.conflicts
+    readonly property int changes: repo.fileCount || 0
     readonly property string ci: repo.gh ? repo.gh.ci : ""
 
     spacing: 0
@@ -758,7 +766,7 @@ Panel {
           Badge { visible: rowRoot.repo.conflicts > 0; text: "!" + rowRoot.repo.conflicts; color: root.red; tip: "merge conflicts" }
           Badge { visible: rowRoot.repo.ahead > 0; text: "↑" + rowRoot.repo.ahead; color: root.yellow; tip: rowRoot.repo.remote !== "" ? "commits to push" : "local commits (no remote)" }
           Badge { visible: rowRoot.repo.behind > 0; text: "↓" + rowRoot.repo.behind; color: root.blue; tip: "commits to pull" }
-          Badge { visible: rowRoot.changes > 0; text: "●" + rowRoot.changes; color: root.fg; tip: rowRoot.repo.staged + " staged, " + rowRoot.repo.modified + " modified" }
+          Badge { visible: rowRoot.changes > 0; text: "●" + rowRoot.changes; color: root.fg; tip: strings.t("stagedCount").arg(rowRoot.repo.staged) }
           Badge { visible: rowRoot.ci !== ""; text: root.ciGlyph(rowRoot.ci); color: root.ciColor(rowRoot.ci); tip: root.ciLabel(rowRoot.ci) + " on " + rowRoot.repo.branch }
 
           Text {
@@ -821,6 +829,114 @@ Panel {
       spacing: Style.space(2)
 
       readonly property real innerWidth: width - leftPadding - rightPadding
+
+      Row {
+        width: parent.innerWidth
+        spacing: Style.space(6)
+
+        LinkButton {
+          text: strings.t("stageAll")
+          enabled: !actionProc.running && rowRoot.repo.conflicts === 0
+                   && (rowRoot.repo.modified > 0 || rowRoot.repo.untracked > 0)
+          onClicked: root.runAction("stage", rowRoot.repo)
+        }
+
+        LinkButton {
+          text: strings.t("push")
+          enabled: !actionProc.running && rowRoot.repo.ahead > 0 && rowRoot.repo.remote !== ""
+          onClicked: root.runAction("push", rowRoot.repo)
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          anchors.verticalCenter: parent.verticalCenter
+          text: strings.t("stagedCount").arg(Commons.I18n.formatNumber(rowRoot.repo.staged || 0))
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      Row {
+        visible: rowRoot.changes > 0
+        width: parent.innerWidth
+        spacing: Style.space(6)
+
+        Rectangle {
+          width: parent.width - commitButton.width - parent.spacing
+          height: Style.space(28)
+          radius: Style.space(4)
+          color: "transparent"
+          border.color: root.dim
+
+          TextInput {
+            id: commitMessage
+            anchors.fill: parent
+            anchors.margins: Style.space(5)
+            verticalAlignment: TextInput.AlignVCenter
+            color: root.fg
+            selectionColor: root.blue
+            clip: true
+            maximumLength: 240
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            onAccepted: if (commitButton.enabled) commitButton.clicked()
+            Keys.onEscapePressed: keyCatcher.forceActiveFocus()
+          }
+
+          Connections {
+            target: root
+            function onCommitSucceeded(repoPath) {
+              if (repoPath === rowRoot.repo.path) commitMessage.clear()
+            }
+          }
+
+          Text {
+            anchors.fill: commitMessage
+            verticalAlignment: Text.AlignVCenter
+            visible: commitMessage.text.length === 0
+            text: strings.t("commitMessage")
+            color: root.dim
+            font: commitMessage.font
+          }
+        }
+
+        LinkButton {
+          id: commitButton
+          text: strings.t("commit")
+          anchors.verticalCenter: parent.verticalCenter
+          enabled: !actionProc.running && rowRoot.repo.staged > 0 && rowRoot.repo.conflicts === 0
+                   && commitMessage.text.trim().length > 0
+          onClicked: {
+            root.runAction("commit", rowRoot.repo, commitMessage.text.trim())
+            keyCatcher.forceActiveFocus()
+          }
+        }
+      }
+
+      Repeater {
+        model: rowRoot.expanded ? (rowRoot.repo.files || []) : []
+
+        Text {
+          required property var modelData
+          textFormat: Text.PlainText
+          width: parent.innerWidth
+          elide: Text.ElideRight
+          text: strings.t(modelData.status).arg(modelData.path.slice(0, 1024))
+          color: root.fg
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      Text {
+        visible: rowRoot.changes > (rowRoot.repo.files || []).length
+        textFormat: Text.PlainText
+        text: strings.t("visibleFiles").arg((rowRoot.repo.files || []).length).arg(rowRoot.changes)
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
 
       Text {
         textFormat: Text.PlainText

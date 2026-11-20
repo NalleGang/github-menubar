@@ -22,16 +22,40 @@ for root in "${roots[@]}"; do
 done
 
 for repo in "${repos[@]}"; do
-  IFS=$US read -r head upstream ahead behind staged modified untracked conflicts stash < <(
-    git -C "$repo" status --porcelain=v2 --branch --show-stash 2>/dev/null | awk -v OFS="$US" '
+  mapfile -t status < <(
+    git -C "$repo" status --porcelain=v2 --branch --show-stash --untracked-files=all 2>/dev/null | awk -v OFS="$US" '
       /^# branch.head /     { head = $3 }
       /^# branch.upstream / { up = $3 }
       /^# branch.ab /       { a = substr($3, 2); b = substr($4, 2) }
       /^# stash /           { st = $3 }
-      /^[12] / { if (substr($2, 1, 1) != ".") s++; if (substr($2, 2, 1) != ".") m++ }
-      /^u /    { c++ }
-      /^\? /   { u++ }
-      END { print head, up, a + 0, b + 0, s + 0, m + 0, u + 0, c + 0, st + 0 }')
+      /^[12u?] / {
+        path = $0
+        fields = $1 == "1" ? 8 : ($1 == "2" ? 9 : ($1 == "u" ? 10 : 1))
+        for (i = 0; i < fields; i++) sub(/^[^ ]+ /, "", path)
+        if ($1 == "2") {
+          split(path, rename, "\t")
+          path = rename[2] " → " rename[1]
+        }
+        # Keep filenames on one display line. Git already quotes control characters.
+        if ($1 == "u") { c++; label = "Conflict" }
+        else if ($1 == "?") { u++; label = "Untracked" }
+        else {
+          indexChanged = substr($2, 1, 1) != "."
+          worktreeChanged = substr($2, 2, 1) != "."
+          s += indexChanged
+          m += worktreeChanged
+          label = indexChanged ? (worktreeChanged ? "Staged + unstaged" : "Staged") : "Unstaged"
+        }
+        group = label ~ /^Staged/ ? 1 : 2
+        if (++count[group] <= 200) files[group, count[group]] = label OFS path
+      }
+      END {
+        print head, up, a + 0, b + 0, s + 0, m + 0, u + 0, c + 0, st + 0, count[1] + count[2]
+        for (group = 1; group <= 2; group++)
+          for (i = 1; i <= count[group] && i <= 200; i++)
+            print "F", files[group, i]
+      }')
+  IFS=$US read -r head upstream ahead behind staged modified untracked conflicts stash fileCount <<< "${status[0]}"
   [[ -n $head ]] || continue
 
   remote=$(git -C "$repo" remote 2>/dev/null | grep -m1 -x origin || git -C "$repo" remote 2>/dev/null | head -1)
@@ -49,10 +73,11 @@ for repo in "${repos[@]}"; do
   gitdir=$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null)
   fetched=$(stat -c %Y "$gitdir/FETCH_HEAD" 2>/dev/null || echo 0)
 
-  printf 'R%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+  printf 'R%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
     "$US" "$repo" "$US" "${repo##*/}" "$US" "$head" "$US" "$upstream" "$US" "$ahead" "$US" "$behind" \
     "$US" "$staged" "$US" "$modified" "$US" "$untracked" "$US" "$conflicts" "$US" "$stash" \
-    "$US" "$remote" "$US" "$slug" "$US" "$fetched"
+    "$US" "$remote" "$US" "$slug" "$US" "$fetched" "$US" "$fileCount"
+  if ((${#status[@]} > 1)); then printf '%s\n' "${status[@]:1:200}"; fi
   git -C "$repo" log -n "$commits" --no-show-signature --format="C${US}%h${US}%ct${US}%an${US}%s" 2>/dev/null
 done | jq -R -s -c '
   split("\n")
@@ -65,8 +90,10 @@ done | jq -R -s -c '
           staged: ($f[7] | tonumber), modified: ($f[8] | tonumber),
           untracked: ($f[9] | tonumber), conflicts: ($f[10] | tonumber),
           stash: ($f[11] | tonumber), remote: $f[12], slug: $f[13],
-          fetchedAt: ($f[14] | tonumber), commits: []
+          fetchedAt: ($f[14] | tonumber), fileCount: ($f[15] | tonumber), files: [], commits: []
         }]
+      elif $f[0] == "F" and length > 0 then
+        .[-1].files += [{ status: $f[1], path: $f[2] }]
       elif $f[0] == "C" and length > 0 then
         .[-1].commits += [{ hash: $f[1], time: ($f[2] | tonumber), author: $f[3], subject: ($f[4:] | join("\u001f")) }]
       else . end)
