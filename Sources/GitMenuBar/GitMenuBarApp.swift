@@ -186,7 +186,9 @@ struct Dashboard: View {
                     Text("Git Stage").font(.headline)
                     Spacer()
                 }
-                Button(action: chooseFolder) label: { Image(systemName: "plus") }
+                Button(action: chooseFolder) {
+                    Image(systemName: "plus")
+                }
                     .help("Add a repository")
                     .accessibilityLabel("Add a repository")
                     .disabled(model.busy)
