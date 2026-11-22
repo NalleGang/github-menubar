@@ -10,6 +10,7 @@ struct GitChange: Identifiable, Sendable {
 
 struct Git: Sendable {
     static func status(_ path: String) throws -> [GitChange] {
+        let nestedRepositories = nestedRepositoryPaths(in: path)
         let output = try run(
             ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
             in: path, readOnly: true
@@ -28,13 +29,20 @@ struct Git: Sendable {
             let name = Data(record.dropFirst(3))
             let displayName = String(decoding: name, as: UTF8.self)
             var displayPath = displayName
+            var originalPath: String?
             if flags.contains("R") || flags.contains("C") {
                 guard index < records.count else {
                     throw Failure("Git returned a rename without its original path.")
                 }
                 let original = String(decoding: records[index], as: UTF8.self)
                 displayPath = "\(original) → \(displayName)"
+                originalPath = original
                 index += 1
+            }
+
+            guard !isInsideNestedRepository(displayName, nestedRepositories),
+                  originalPath.map({ !isInsideNestedRepository($0, nestedRepositories) }) ?? true else {
+                continue
             }
 
             let conflict = ["DD", "AU", "UD", "UA", "DU", "AA", "UU"].contains(flags)
@@ -50,7 +58,8 @@ struct Git: Sendable {
     }
 
     static func stage(_ path: String) throws {
-        _ = try run(["add", "--all"], in: path)
+        let exclusions = nestedRepositoryPaths(in: path).map { ":(exclude)\($0)" }
+        _ = try run(["add", "--all", "--", "."] + exclusions, in: path)
     }
 
     static func commit(_ path: String, message: String) throws {
@@ -67,6 +76,61 @@ struct Git: Sendable {
             throw Failure("Git returned an unreadable repository path.")
         }
         return root
+    }
+
+    /// Finds a Git checkout at `path`, plus any checkouts one directory below it.
+    /// This matches the lightweight folder scanning the original Omarchy widget used.
+    static func discoverRepositories(in path: String) throws -> [String] {
+        let files = FileManager.default
+        let rootURL = URL(fileURLWithPath: path, isDirectory: true)
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isHiddenKey]
+        let children = try files.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        )
+        let directories = children.filter {
+            (try? $0.resourceValues(forKeys: keys).isDirectory) == true
+        }
+        let candidates = [rootURL] + directories
+        var repositories: [String] = []
+
+        for candidate in candidates {
+            if let repository = try? root(candidate.path), !repositories.contains(repository) {
+                repositories.append(repository)
+            }
+        }
+        return repositories.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    private static func nestedRepositoryPaths(in path: String) -> [String] {
+        let files = FileManager.default
+        let rootURL = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        guard let children = try? files.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        return children.compactMap { child in
+            guard (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+                  let repository = try? root(child.path) else {
+                return nil
+            }
+            let repositoryURL = URL(fileURLWithPath: repository, isDirectory: true).standardizedFileURL
+            guard repositoryURL.path != rootURL.path,
+                  repositoryURL.path.hasPrefix(rootURL.path + "/") else {
+                return nil
+            }
+            return String(repositoryURL.path.dropFirst(rootURL.path.count + 1))
+        }
+    }
+
+    private static func isInsideNestedRepository(_ candidate: String, _ nestedRepositories: [String]) -> Bool {
+        let normalized = candidate.hasSuffix("/") ? String(candidate.dropLast()) : candidate
+        return nestedRepositories.contains { normalized == $0 || normalized.hasPrefix($0 + "/") }
     }
 
     private static func run(
