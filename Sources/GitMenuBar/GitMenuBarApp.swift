@@ -32,8 +32,11 @@ struct StatusIcon: View {
     @ObservedObject var model: DashboardModel
 
     var body: some View {
-        Image(systemName: model.icon)
-            .accessibilityLabel(Text(model.iconDescription))
+        HStack(spacing: 3) {
+            Image(systemName: model.icon)
+            if !model.syncCounts.isEmpty { Text(model.syncCounts) }
+        }
+        .accessibilityLabel(Text([model.iconDescription, model.syncCounts].filter { !$0.isEmpty }.joined(separator: ", ")))
     }
 }
 
@@ -41,16 +44,29 @@ struct StatusIcon: View {
 final class DashboardModel: ObservableObject {
     @Published private(set) var repos = UserDefaults.standard.stringArray(forKey: "repositories") ?? []
     @Published private(set) var watchedFolders = UserDefaults.standard.stringArray(forKey: "watchedFolders") ?? []
-    @Published private(set) var statuses: [String: [GitChange]] = [:]
+    @Published private(set) var statuses: [String: RepositoryStatus] = [:]
     @Published private(set) var statusErrors: [String: String] = [:]
     @Published private(set) var busy = false
     @Published var selected = ""
     @Published var actionError: String?
     @Published var drafts: [String: String] = [:]
+    @Published var inspection: String?
     private var refreshTask: Task<Void, Never>?
+    private var excluded = Set(UserDefaults.standard.stringArray(forKey: "excludedRepositories") ?? [])
     private var lastDiscovery = Date.distantPast
 
-    var needsAttention: Bool { statuses.values.contains { !$0.isEmpty } }
+    var needsAttention: Bool { statuses.values.contains { !$0.changes.isEmpty } }
+    var syncCounts: String {
+        var ahead = 0, behind = 0
+        for status in statuses.values {
+            let counts = status.divergence
+            ahead += counts.ahead
+            behind += counts.behind
+        }
+        return [ahead > 0 ? "↑\(ahead)" : "", behind > 0 ? "↓\(behind)" : ""]
+            .filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
     var icon: String {
         if !statusErrors.isEmpty { return "exclamationmark.circle.fill" }
         return needsAttention ? "tray.full.fill" : "tray"
@@ -90,9 +106,9 @@ final class DashboardModel: ObservableObject {
                 let statuses = allPaths.map { path in (path, Result { try Git.status(path) }) }
                 return (discovered, statuses)
             }.value
-            if shouldDiscover {
+            if shouldDiscover && watchedFolders == folders {
                 lastDiscovery = Date()
-                let added = result.0.filter { !repos.contains($0) }
+                let added = Set(result.0).subtracting(repos).subtracting(excluded)
                 if !added.isEmpty {
                     repos.append(contentsOf: added)
                     repos.sort { $0.localizedStandardCompare($1) == .orderedAscending }
@@ -119,6 +135,7 @@ final class DashboardModel: ObservableObject {
         await perform {
             try Git.root(folder.path)
         } onSuccess: { root in
+            self.excluded.remove(root)
             if !self.repos.contains(root) {
                 self.repos.append(root)
                 self.save()
@@ -137,6 +154,7 @@ final class DashboardModel: ObservableObject {
                 self.watchedFolders.sort { $0.localizedStandardCompare($1) == .orderedAscending }
                 self.save()
             }
+            self.excluded.subtract(repositories)
             let added = repositories.filter { !self.repos.contains($0) }
             if !added.isEmpty {
                 self.repos.append(contentsOf: added)
@@ -156,6 +174,7 @@ final class DashboardModel: ObservableObject {
     func removeSelected() {
         guard !busy else { return }
         let path = selected
+        if !watchedFolders.isEmpty { excluded.insert(path) }
         repos.removeAll { $0 == path }
         statuses[path] = nil
         statusErrors[path] = nil
@@ -165,10 +184,27 @@ final class DashboardModel: ObservableObject {
         save()
     }
 
-    func stage() async {
+    func stage(_ change: GitChange? = nil) async {
         let path = selected
         guard repos.contains(path) else { return }
-        await perform { try Git.stage(path) } onSuccess: { _ in }
+        await perform { try Git.stage(path, change: change) } onSuccess: { _ in }
+    }
+
+    func unstage(_ change: GitChange) async {
+        let path = selected
+        await perform { try Git.unstage(path, change: change) } onSuccess: { _ in }
+    }
+
+    func sync(_ action: SyncAction) async {
+        let path = selected
+        await perform { try Git.sync(path, action: action) } onSuccess: { _ in }
+    }
+
+    func inspect(_ operation: @escaping @Sendable (String) throws -> String) async {
+        let path = selected
+        await perform { try operation(path) } onSuccess: { text in
+            self.inspection = text
+        }
     }
 
     func commit() async {
@@ -183,6 +219,7 @@ final class DashboardModel: ObservableObject {
     }
 
     private func save() {
+        UserDefaults.standard.set(Array(excluded), forKey: "excludedRepositories")
         UserDefaults.standard.set(repos, forKey: "repositories")
         UserDefaults.standard.set(watchedFolders, forKey: "watchedFolders")
     }
@@ -194,6 +231,7 @@ final class DashboardModel: ObservableObject {
         guard !busy else { return }
         busy = true
         actionError = nil
+        inspection = nil
         // Let an in-flight refresh finish before mutating the index.
         await refreshTask?.value
         let result = await Task.detached { Result(catching: operation) }.value
@@ -208,19 +246,20 @@ final class DashboardModel: ObservableObject {
 
 @MainActor
 struct Dashboard: View {
+    @State private var showAccount = false
     @ObservedObject var model: DashboardModel
 
-    private var changes: [GitChange] { model.statuses[model.selected] ?? [] }
+    private var changes: [GitChange] { model.statuses[model.selected]?.changes ?? [] }
     private var hasConflict: Bool { changes.contains { $0.conflict } }
     private var stagedCount: Int { changes.filter(\.staged).count }
     private var unstagedCount: Int { changes.filter(\.unstaged).count }
-    private var totalChangeCount: Int { model.statuses.values.reduce(0) { $0 + $1.count } }
+    private var totalChangeCount: Int { model.statuses.values.reduce(0) { $0 + $1.changes.count } }
     private var repositoryName: String {
         URL(fileURLWithPath: model.selected).lastPathComponent
     }
     private var subtitle: String {
         guard !model.repos.isEmpty else { return "Your local Git dashboard" }
-        let repositoryText = "\(model.repos.count) repos"
+        let repositoryText = model.repos.count == 1 ? "1 repo" : "\(model.repos.count) repos"
         let changeText = totalChangeCount == 1 ? "1 change" : "\(totalChangeCount) changes"
         return "\(repositoryText) · \(changeText)"
     }
@@ -233,7 +272,10 @@ struct Dashboard: View {
         VStack(alignment: .leading, spacing: 14) {
             header
 
-            if model.repos.isEmpty {
+            if showAccount {
+                ScrollView { AccountPanel().frame(maxWidth: .infinity, alignment: .leading) }
+                    .frame(height: 360)
+            } else if model.repos.isEmpty {
                 emptyState
             } else {
                 repositoryPicker
@@ -244,14 +286,16 @@ struct Dashboard: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 4)
                 } else {
+                    repositoryTools
                     summary
                     repositoryContents
                 }
             }
 
-            if let error = model.actionError ?? model.statusErrors[model.selected] {
+            if !showAccount, let error = model.actionError ?? model.statusErrors[model.selected] {
                 Label {
-                    Text(error).font(.caption).textSelection(.enabled)
+                    ScrollView { Text(error).font(.caption).textSelection(.enabled) }
+                        .frame(maxHeight: 64)
                 } icon: {
                     Image(systemName: "exclamationmark.triangle.fill")
                 }
@@ -268,7 +312,10 @@ struct Dashboard: View {
         .task {
             await model.refresh()
         }
-        .onChange(of: model.selected) { _ in model.actionError = nil }
+        .onChange(of: model.selected) { _ in
+            model.actionError = nil
+            model.inspection = nil
+        }
     }
 
     private var header: some View {
@@ -283,7 +330,9 @@ struct Dashboard: View {
                 Text(subtitle).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
-            addMenu
+            Button(showAccount ? "Repositories" : "GitHub") { showAccount.toggle() }
+                .disabled(model.busy)
+            if !showAccount { addMenu }
         }
     }
 
@@ -318,22 +367,64 @@ struct Dashboard: View {
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 4)
-            ForEach(model.repos, id: \.self) { path in
-                Button {
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        model.selected = model.selected == path ? "" : path
+            ScrollView {
+                VStack(spacing: 7) {
+                    ForEach(model.repos, id: \.self) { path in
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                model.selected = model.selected == path ? "" : path
+                            }
+                        } label: {
+                            RepositoryRow(
+                                path: path,
+                                changes: model.statuses[path]?.changes,
+                                error: model.statusErrors[path],
+                                isExpanded: model.selected == path
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("\(URL(fileURLWithPath: path).lastPathComponent), \(model.selected == path ? "expanded" : "collapsed")")
+                        .disabled(model.busy)
                     }
-                } label: {
-                    RepositoryRow(
-                        path: path,
-                        changes: model.statuses[path],
-                        error: model.statusErrors[path],
-                        isExpanded: model.selected == path
-                    )
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("\(URL(fileURLWithPath: path).lastPathComponent), \(model.selected == path ? "expanded" : "collapsed")")
-                .disabled(model.busy)
+            }
+            .frame(height: min(150, CGFloat(model.repos.count) * 53))
+        }
+    }
+
+    @ViewBuilder private var repositoryTools: some View {
+        if let status = model.statuses[model.selected] {
+            HStack {
+                Label(status.branch, systemImage: "arrow.triangle.branch")
+                    .font(.caption)
+                    .lineLimit(1)
+                    .help(status.branch)
+                Spacer()
+                Button("History") {
+                    Task { await model.inspect { try Git.history($0) } }
+                }
+                Menu("Sync") {
+                    ForEach(SyncAction.allCases, id: \.self) { action in
+                        Button(action.rawValue) { Task { await model.sync(action) } }
+                    }
+                }
+                .fixedSize()
+            }
+            .disabled(model.busy)
+        }
+        if let inspection = model.inspection {
+            HStack(alignment: .top) {
+                ScrollView {
+                    Text(verbatim: inspection)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 96)
+                Button { model.inspection = nil } label: {
+                    Image(systemName: "xmark")
+                }
+                .accessibilityLabel("Close preview")
             }
         }
     }
@@ -437,12 +528,32 @@ struct Dashboard: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
                     ForEach(changes) { change in
-                        ChangeRow(change: change, label: statusLabel(for: change))
+                        ChangeRow(change: change, label: statusLabel(for: change)) {
+                            if change.unstaged {
+                                Button("Stage File") { Task { await model.stage(change) } }
+                            }
+                            if change.staged {
+                                Button("Unstage File") { Task { await model.unstage(change) } }
+                            }
+                            if change.canPreview {
+                                if change.unstaged {
+                                    Button("Show Unstaged Diff") {
+                                        Task { await model.inspect { try Git.diff($0, change: change, staged: false) } }
+                                    }
+                                }
+                                if change.staged {
+                                    Button("Show Staged Diff") {
+                                        Task { await model.inspect { try Git.diff($0, change: change, staged: true) } }
+                                    }
+                                }
+                            }
+                        }
+                        .disabled(model.busy || change.conflict)
                     }
                 }
                 .padding(1)
             }
-            .frame(height: min(190, CGFloat(changes.count) * 42))
+            .frame(height: min(model.inspection == nil ? 170 : 78, CGFloat(changes.count) * 42))
         }
 
         VStack(spacing: 10) {
@@ -494,9 +605,10 @@ private struct SummaryPill: View {
 }
 
 @MainActor
-private struct ChangeRow: View {
+private struct ChangeRow<Actions: View>: View {
     let change: GitChange
     let label: String
+    @ViewBuilder let actions: () -> Actions
 
     private var tint: Color {
         if change.conflict { return .red }
@@ -520,6 +632,14 @@ private struct ChangeRow: View {
                 .padding(.horizontal, 7)
                 .padding(.vertical, 3)
                 .background(tint.opacity(0.12), in: Capsule())
+            Menu {
+                actions()
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .accessibilityLabel("Actions for \(change.path)")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
